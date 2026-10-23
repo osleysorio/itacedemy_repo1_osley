@@ -455,6 +455,20 @@ def _vacio(campo):
     return {"$in": [{"$ifNull": [f"${campo}", ""]}, [""]]}
 
 
+#PLACEHOLDERS_SIN_DATO = ["", "NO ESPECIFICADO", "NO ESPECIFICADA", "DESCONOCIDO", "DESCONOCIDA", "SIN DATO", "SIN DATOS", "N/A", "NA", "NULL", "NONE", "-"]
+PLACEHOLDERS_SIN_DATO = ["", "NO ESPECIFICADO", "NO ESPECIFICADA", "DESCONOCIDO", "DESCONOCIDA", "SIN DATO", "SIN DATOS", "N/A", "NA", "NULL", "NONE", "-", "NO_ESPECIFICADO", "SIN_ESPECIFICAR"]
+
+
+
+def _sin_dato(campo):
+    """Mongo: true si el campo falta, está vacío, solo tiene espacios o contiene un marcador como «NO ESPECIFICADO»."""
+    txt = {"$toUpper": {"$trim": {"input": {"$convert": {"input": f"${campo}", "to": "string", "onError": "", "onNull": ""}}}}}
+    return {"$or": [
+        {"$in": [txt, PLACEHOLDERS_SIN_DATO]},
+        {"$eq": [txt, ""]}
+    ]}
+
+
 @cache_bd(ttl=120)
 def obtener_resumen_global():
     es_true = lambda c: {"$eq": [{"$ifNull": [f"${c}", False]}, True]}
@@ -463,8 +477,8 @@ def obtener_resumen_global():
         "total": {"$sum": 1},
         "ok": _cuenta_si({"$and": [es_true("procesado_por_ia"), {"$not": [es_true("tiene_problema_estructural")]}]}),
         "problema": _cuenta_si(es_true("tiene_problema_estructural")),
-        "sin_sexo": _cuenta_si(_vacio("sexo")),
-        "sin_modalidad": _cuenta_si(_vacio("modalidad")),
+        "sin_sexo": _cuenta_si(_sin_dato("sexo")),
+        "sin_modalidad": _cuenta_si(_sin_dato("modalidad")),
     }}]
     res = list(collection.aggregate(pipeline, allowDiskUse=True))
     r = res[0] if res else {"total": 0, "ok": 0, "problema": 0, "sin_sexo": 0, "sin_modalidad": 0}
@@ -569,17 +583,26 @@ def obtener_longitud_vs_fallo():
     return df.sort_values("Rango (caracteres HTML)")
 
 
+
 @cache_bd(ttl=300)
 def obtener_completitud(campos):
     grupo = {"_id": None, "total": {"$sum": 1}}
     for i, c in enumerate(campos):
-        grupo[f"c{i}"] = _cuenta_si({"$not": [_vacio(c)]})
+        # Aplicamos _sin_dato(c) directamente a todos los campos para capturar "NO ESPECIFICADO" siempre
+        grupo[f"c{i}"] = _cuenta_si({"$not": [_sin_dato(c)]})
     res = list(collection.aggregate([{"$group": grupo}], allowDiskUse=True))
     if not res:
         return pd.DataFrame()
     r = res[0]
-    return pd.DataFrame([{"Campo": c, "% completo": div(r[f"c{i}"], r["total"]) * 100}
-                         for i, c in enumerate(campos)])
+    return pd.DataFrame([
+        {
+            "campo": str(c), 
+            "% completo": div(r[f"c{i}"], r["total"]) * 100, 
+            "con dato": r[f"c{i}"],
+            "sin dato": r["total"] - r[f"c{i}"], 
+            "total": r["total"]
+        } for i, c in enumerate(campos)
+    ])
 
 
 @cache_bd(ttl=300)
@@ -674,6 +697,43 @@ def obtener_top_valores(f, campo):
         {"$match": {"v": {"$nin": EXCLUIR_VALORES_N}}},
         {"$group": {"_id": "$v", "n": {"$sum": 1}}}, {"$sort": {"n": -1}}, {"$limit": 10}],
         [campo.capitalize(), "Frecuencia"])
+
+
+CAMPO_HTML = "resto_html"      # campo con el HTML original del informe
+TRAMOS_HTML = [(0, "<500"), (500, "500-1k"), (1000, "1k-2k"), (2000, "2k-4k"), (4000, "4k-8k"), (8000, "8k-16k"), (16000, ">16k")]
+EXPR_HTML_VACIO = {"$cond": [{"$eq": [{"$type": f"${CAMPO_HTML}"}, "string"]},
+                             {"$regexMatch": {"input": f"${CAMPO_HTML}", "regex": r"^\s*$"}}, True]}   # omitido, null, no texto o solo espacios
+
+
+@cache_bd(show_spinner="Contando los HTML vacíos u omitidos...")
+def obtener_resumen_vacios():
+    """HTML vacío u omitido en TODA la base y su relación con el procesamiento."""
+    pipeline = [{"$group": {"_id": {"vacio": EXPR_HTML_VACIO, "prob": _es_true("tiene_problema_estructural"),
+                                    "proc": _es_true("procesado_por_ia")}, "n": {"$sum": 1}}}]
+    r = {"vacios_total": 0, "vacios_marcados": 0, "vacios_pendientes": 0, "problemas": 0, "problemas_estructura": 0}
+    for d in collection.aggregate(pipeline, allowDiskUse=True):
+        k, n = d["_id"], d["n"]
+        if k["vacio"]:
+            r["vacios_total"] += n
+            r["vacios_marcados"] += n if k["prob"] else 0
+            r["vacios_pendientes"] += n if not k["proc"] else 0
+        if k["prob"]:
+            r["problemas"] += n
+            r["problemas_estructura"] += n if not k["vacio"] else 0
+    return r
+
+
+@cache_bd(show_spinner="Repartiendo los problemas por longitud del HTML...")
+def obtener_problemas_por_tramo():
+    """Informes con problema estructural según la longitud de su HTML (el tramo «<500» incluye los de longitud 0). Todos los registros, sin muestreo."""
+    largo = {"$strLenCP": {"$convert": {"input": f"${CAMPO_HTML}", "to": "string", "onError": "", "onNull": ""}}}
+    ramas = [{"case": {"$lt": ["$largo", TRAMOS_HTML[i + 1][0]]}, "then": TRAMOS_HTML[i][1]} for i in range(len(TRAMOS_HTML) - 1)]
+    pipeline = [{"$match": {"$expr": _es_true("tiene_problema_estructural")}},   # todos los informes con problema; longitud 0 (sin texto) cae en «<500»
+                {"$project": {"largo": largo}},
+                {"$project": {"tramo": {"$switch": {"branches": ramas, "default": TRAMOS_HTML[-1][1]}}}},
+                {"$group": {"_id": "$tramo", "n": {"$sum": 1}}}]
+    cnt = {d["_id"]: d["n"] for d in collection.aggregate(pipeline, allowDiskUse=True)}
+    return pd.DataFrame([{"Tramo": e, "Cantidad": cnt.get(e, 0)} for _, e in TRAMOS_HTML])
 
 
 @cache_bd(ttl=600, show_spinner="Leyendo los nombres de estudio originales...")
@@ -791,9 +851,12 @@ def mostrar_heatmap(p, eje_a, eje_b, porcentaje):
         return
     datos = p.div(p.sum(axis=1).replace(0, 1), axis=0) * 100 if porcentaje else p
     fig = px.imshow(datos, text_auto=".0f" if porcentaje else True, aspect="auto",
-                    color_continuous_scale="Blues",
+                    color_continuous_scale="Blues", zmin=0 if porcentaje else None, zmax=100 if porcentaje else None,
                     labels=dict(x=eje_b, y=eje_a, color="% fila" if porcentaje else "Cantidad"))
-    fig.update_layout(height=max(350, 34 * len(datos) + 120), margin=dict(t=20, b=10, l=10, r=10))
+    fig.update_traces(textfont=dict(size=13))
+    if porcentaje:
+        fig.update_layout(coloraxis_colorbar=dict(title="% fila", tickvals=[0, 25, 50, 75, 100], ticksuffix=" %"))
+    fig.update_layout(height=max(350, 36 * len(datos) + 120), margin=dict(t=20, b=10, l=10, r=10))
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -805,8 +868,9 @@ def mostrar_barras_apiladas(p, eje_a, eje_b):
     largo = pct.reset_index().melt(id_vars=eje_a, var_name=eje_b, value_name="%")
     fig = px.bar(largo, x="%", y=eje_a, color=eje_b, orientation="h", barmode="stack", text_auto=".0f",
                  color_discrete_map=COLORES_CLASIF if eje_b == "Clasificación" else None)
-    fig.update_layout(height=max(320, 30 * len(pct) + 120), xaxis_title="% de la fila", yaxis_title=None,
-                      legend_title=None, margin=dict(t=10, b=10, l=10, r=10))
+    fig.update_traces(textposition="inside", textfont=dict(size=12))
+    fig.update_layout(height=max(320, 32 * len(pct) + 120), xaxis_title="% de la fila", yaxis_title=None, xaxis_range=[0, 100],
+                      uniformtext_minsize=9, uniformtext_mode="hide", legend_title=None, margin=dict(t=10, b=10, l=10, r=10))
     fig.update_yaxes(autorange="reversed")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -1079,6 +1143,12 @@ def _cv(df):
     return df.columns[0], df.columns[-1]
 
 
+def estilo_valores(fig, tam=13):
+    """Valores dentro de la barra (blanco, pegados al extremo) cuando caben y fuera (oscuro) cuando no."""
+    fig.update_traces(textposition="auto", insidetextanchor="end", cliponaxis=False, textfont=dict(size=tam),
+                      insidetextfont=dict(color="white", size=tam), outsidetextfont=dict(color="#1E293B", size=tam))
+
+
 def barras(df, cat, val, pct, horizontal=True, color="#0E7490", top=None, altura=None, base=None):
     tot = base if base else df[val].sum()
     d = df[[cat, val]].copy()
@@ -1088,12 +1158,15 @@ def barras(df, cat, val, pct, horizontal=True, color="#0E7490", top=None, altura
     if horizontal:
         d = d.sort_values("valor")
         fig = px.bar(d, x="valor", y=cat, orientation="h", color_discrete_sequence=[color])
-        fig.update_traces(texttemplate="%{x:.1f}%" if pct else "%{x:,.0f}", textposition="outside")
+        fig.update_traces(texttemplate="%{x:.1f}%" if pct else "%{x:,.0f}")
         fig.update_layout(xaxis_title="% del total" if pct else "Cantidad", yaxis_title=None)
+        fig.update_xaxes(range=[0, float(d["valor"].max() or 1) * 1.15])
     else:
         fig = px.bar(d, x=cat, y="valor", color_discrete_sequence=[color])
-        fig.update_traces(texttemplate="%{y:.1f}%" if pct else "%{y:,.0f}", textposition="outside")
+        fig.update_traces(texttemplate="%{y:.1f}%" if pct else "%{y:,.0f}")
         fig.update_layout(yaxis_title="% del total" if pct else "Cantidad", xaxis_title=None)
+        fig.update_yaxes(range=[0, float(d["valor"].max() or 1) * 1.15])
+    estilo_valores(fig)
     fig.update_layout(height=altura or (max(300, 28 * len(d) + 100) if horizontal else 340), showlegend=False,
                       margin=dict(t=20, b=10, l=10, r=10))
     st.plotly_chart(fig, use_container_width=True)
@@ -1102,8 +1175,9 @@ def barras(df, cat, val, pct, horizontal=True, color="#0E7490", top=None, altura
 def donut(df, cat, val, pct, colores=None):
     fig = px.pie(df, names=cat, values=val, hole=0.45, color=cat, color_discrete_map=colores,
                  color_discrete_sequence=px.colors.qualitative.Safe)
-    fig.update_traces(textinfo="percent+label" if pct else "value+label")
-    fig.update_layout(height=330, margin=dict(t=20, b=10, l=10, r=10), showlegend=False)
+    fig.update_traces(textinfo="percent+label" if pct else "value+label", textposition="auto", textfont_size=14,
+                      insidetextorientation="horizontal")
+    fig.update_layout(height=340, margin=dict(t=20, b=10, l=10, r=10), showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -1314,6 +1388,13 @@ def ui_proceso():
     c[3].metric("Con problema estructural", f"{r['problema']:,}", f"{div(r['problema'], proc):.1%} de los procesados", delta_color="inverse")
     c[4].metric("Pendientes de procesar", f"{r['pendientes']:,}", f"{div(r['pendientes'], total):.1%} del total", delta_color="off")
     st.progress(min(div(proc, total), 1.0), text=f"Avance del procesamiento: {div(proc, total):.1%} ({proc:,} de {total:,} informes)")
+    rv = obtener_resumen_vacios()
+    k2 = st.columns(4)
+    k2[0].metric("HTML vacío u omitido (toda la base)", f"{rv['vacios_total']:,}", f"{div(rv['vacios_total'], total):.1%} del total", delta_color="off")
+    k2[1].metric("…ya marcados como problema", f"{rv['vacios_marcados']:,}", f"{div(rv['vacios_marcados'], r['problema']):.1%} de los problemas", delta_color="off")
+    k2[2].metric("…aún pendientes de procesar", f"{rv['vacios_pendientes']:,}", f"{div(rv['vacios_pendientes'], r['pendientes']):.1%} de los pendientes", delta_color="off")
+    k2[3].metric("Errores de estructura o JSON", f"{rv['problemas_estructura']:,}", f"{div(rv['problemas_estructura'], r['problema']):.1%} de los problemas", delta_color="off")
+    st.caption("Los HTML vacíos u omitidos pendientes se marcarán como problema al procesarlos: estiman cuántos problemas más aparecerán.")
     vista = st.radio("Ver", ["📊 Estado", "🤖 Modelo, prompt y parámetros", "🛠️ Revisión de problemas"],
                      horizontal=True, key="vista_proc", label_visibility="collapsed")
 
@@ -1330,17 +1411,30 @@ def ui_proceso():
             ds = obtener_distribucion("status", "Status")
             if not ds.empty:
                 barras(ds, "Status", "Cantidad", pct, color="#6366F1")
-        a, b = st.columns(2)
-        with a:
-            st.subheader("Motivos de fallo de la IA")
-            dfm = obtener_motivos_fallo()
-            if dfm.empty:
-                st.success("Sin fallos registrados.")
-            else:
-                dfm["Motivo"] = dfm["Motivo"].astype(str).str.replace(r"\d+", "N", regex=True).str.slice(0, 80)
-                barras(dfm.groupby("Motivo", as_index=False)["Cantidad"].sum(), "Motivo", "Cantidad", pct, top=8, color="#F59E0B")
-        with b:
-            st.subheader("Tasa de problemas según el tamaño del HTML")
+        st.subheader("Informes con problema estructural según la longitud del HTML")
+        dpt = obtener_problemas_por_tramo()
+        if dpt.empty or dpt["Cantidad"].sum() == 0:
+            st.success("No hay informes con problema estructural.")
+        else:
+            dpt = dpt.copy()
+            tot_p = int(dpt["Cantidad"].sum())
+            dpt["pct"] = dpt["Cantidad"] / tot_p * 100
+            dpt["valor"] = dpt["pct"] if pct else dpt["Cantidad"]
+            dpt["etiqueta"] = [(f"<b>{p_:.1f} %</b><br>n = {n_:,}" if pct else f"<b>{n_:,}</b><br>{p_:.1f} %").replace(",", ".")
+                               for p_, n_ in zip(dpt["pct"], dpt["Cantidad"])]
+            fig = px.bar(dpt, x="Tramo", y="valor", color="pct", text="etiqueta", color_continuous_scale="Reds", range_color=[0, 100],
+                         category_orders={"Tramo": list(dpt["Tramo"])},
+                         hover_data={"Cantidad": ":,", "pct": ":.1f", "valor": False, "etiqueta": False})
+            fig.update_traces(textposition="outside", textfont=dict(size=13, color="#1E293B"), cliponaxis=False)
+            fig.update_layout(height=400, xaxis_title="Longitud del HTML (caracteres)",
+                              yaxis_title="% del total de informes con problema" if pct else "Informes con problema",
+                              coloraxis_colorbar=dict(title="% del total", tickvals=[0, 25, 50, 75, 100], ticksuffix=" %"),
+                              margin=dict(t=30, b=10, l=10, r=10))
+            fig.update_yaxes(range=[0, float(dpt["valor"].max()) * 1.3])
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"Reparte los {tot_p:,} informes con problema estructural según la longitud de su HTML. "
+                           "Cada barra es la parte del total que cae en el tramo.".replace(",", "."))
+        with st.expander("📉 Tasa de problemas dentro de cada tramo (muestra, con intervalos de confianza)"):
             dl = obtener_longitud_vs_fallo()
             if not dl.empty and "% problema" in dl.columns:
                 dl = dl.copy()
@@ -1348,30 +1442,44 @@ def ui_proceso():
                 dl["Tramo"] = dl["Rango"] + "<br>n = " + dl["Informes"].map(lambda v: f"{int(v):,}".replace(",", "."))
                 ic = [wilson(int(k), int(n), 0.05) for k, n in zip(dl["Con problema"], dl["Informes"])]
                 dl["lo"], dl["hi"] = [c[0] * 100 for c in ic], [c[1] * 100 for c in ic]
-                fig = px.bar(dl, x="Tramo", y="% problema", color="% problema", color_continuous_scale="Reds",
+                fig = px.bar(dl, x="Tramo", y="% problema", color="% problema", color_continuous_scale="Reds", range_color=[0, 100],
                              error_y=dl["hi"] - dl["% problema"], error_y_minus=dl["% problema"] - dl["lo"],
                              category_orders={"Tramo": list(dl["Tramo"])},
                              hover_data={"Informes": ":,", "Con problema": ":,", "% problema": ":.2f", "Tramo": False})
                 for _, r_ in dl.iterrows():
-                    fig.add_annotation(x=r_["Tramo"], y=r_["hi"], text=f"<b>{r_['% problema']:.1f}%</b>", showarrow=False, yshift=12)
-                fig.update_layout(height=380, coloraxis_showscale=False, xaxis_title="Tamaño del HTML (caracteres) · n = informes del tramo",
-                                  yaxis_title="% de informes con problema", yaxis_range=[0, float(dl["hi"].max()) * 1.18 + 2],
+                    fig.add_annotation(x=r_["Tramo"], y=r_["hi"], text=f"<b>{r_['% problema']:.1f}%</b>", showarrow=False, yshift=14,
+                                       font=dict(size=13))
+                fig.update_layout(height=380, xaxis_title="Longitud del HTML (caracteres) · n = informes del tramo",
+                                  yaxis_title="% de informes procesados con problema", yaxis_range=[0, float(dl["hi"].max()) * 1.2 + 2],
+                                  coloraxis_colorbar=dict(title="% problema", tickvals=[0, 25, 50, 75, 100], ticksuffix=" %"),
                                   margin=dict(t=30, b=10, l=10, r=10))
                 st.plotly_chart(fig, use_container_width=True)
-                st.caption("Barras = % de informes con problema en cada tramo de tamaño; las líneas negras son el intervalo de confianza del 95 % "
-                           "(muy anchas si el tramo tiene pocos informes). Si el % sube con el tamaño, los informes largos desbordan el contexto del modelo.")
+                st.caption("Aquí la tasa se calcula DENTRO de cada tramo (sobre los informes procesados de la muestra); las líneas negras son el intervalo "
+                           "de confianza del 95 % (muy anchas con pocos informes). Si sube con el tamaño, los informes largos desbordan el contexto del modelo.")
         a, b = st.columns(2)
         with a:
             st.subheader("Completitud de campos clave")
             campos = [x for x in ("sexo", "modalidad", "status", CAMPO_HTML, edad_campo, fecha_campo) if x]
             dc = obtener_completitud(campos)
             if not dc.empty:
-                cc, cv = _cv(dc)
-                fig = px.bar(dc.sort_values(cv), x=cv, y=cc, orientation="h", color_discrete_sequence=["#0E7490"])
-                fig.update_traces(texttemplate="%{x:.1f}%", textposition="outside")
-                fig.update_layout(height=max(280, 40 * len(dc) + 80), xaxis_range=[0, 105], xaxis_title="% completo",
+                # Normalizamos nombres de columna por seguridad
+                dc.columns = dc.columns.str.lower()
+                
+                # Ordenamos las barras por nivel de completitud
+                dc = dc.sort_values("% completo").copy()
+                
+                # Generamos la etiqueta personalizada con los datos nativos calculados por MongoDB
+                dc["etq"] = [f"{p:.2f} % · sin dato: {int(x):,}".replace(",", ".") for p, x in zip(dc["% completo"], dc["sin dato"])]
+                
+                fig = px.bar(dc, x="% completo", y="campo", orientation="h", text="etq", color_discrete_sequence=["#0E7490"])
+                estilo_valores(fig)
+                fig.update_layout(height=max(300, 46 * len(dc) + 80), xaxis_range=[0, 105], xaxis_title="% completo",
                                   yaxis_title=None, margin=dict(t=20, b=10, l=10, r=10))
                 st.plotly_chart(fig, use_container_width=True)
+                st.caption(f"Un campo se considera sin dato si falta, está vacío, solo tiene espacios o vale «NO ESPECIFICADO» (o similar), "
+                           f"de modo que el % coincide con la categoría «NO ESPECIFICADO» de los gráficos. Base: {int(dc['total'].iloc[0]):,} registros de toda la base.")
+
+
         with b:
             st.subheader("Cruce Status × Modalidad")
             dsm = obtener_status_x_modalidad()
@@ -1528,9 +1636,14 @@ def ui_clasificacion(f, pct):
         if dim == "Mes":
             fig = px.line(datos, x=datos.index, y=cols, markers=True, color_discrete_map=COLORES_CLASIF)
         elif dim in EJES_ORDEN_NATURAL:
-            fig = px.bar(datos, x=datos.index, y=cols, barmode="stack", color_discrete_map=COLORES_CLASIF)
+            fig = px.bar(datos, x=datos.index, y=cols, barmode="stack", color_discrete_map=COLORES_CLASIF, text_auto=".0f")
         else:
-            fig = px.bar(datos, x=cols, y=datos.index, orientation="h", barmode="stack", color_discrete_map=COLORES_CLASIF)
+            fig = px.bar(datos, x=cols, y=datos.index, orientation="h", barmode="stack", color_discrete_map=COLORES_CLASIF, text_auto=".0f")
+        if dim != "Mes":
+            fig.update_traces(textposition="inside", textfont=dict(size=12, color="white"))
+            fig.update_layout(uniformtext_minsize=9, uniformtext_mode="hide")
+            if pct:
+                (fig.update_xaxes if dim not in EJES_ORDEN_NATURAL else fig.update_yaxes)(range=[0, 100])
         fig.update_layout(height=max(360, 26 * len(datos) + 120) if dim not in EJES_ORDEN_NATURAL else 380,
                           legend_title_text="", xaxis_title=None, yaxis_title="% del total" if pct else "Cantidad",
                           margin=dict(t=20, b=10, l=10, r=10))
@@ -1576,10 +1689,17 @@ def ui_demo_clinica():
             st.markdown("**Edad por sexo** (en %, cada sexo suma 100 %: compara distribuciones, no volúmenes)" if pct else "**Edad por sexo**")
             pir = pir.copy()
             pir["valor"] = pir.groupby("Sexo")["Cantidad"].transform(lambda s: s / s.sum() * 100) if pct else pir["Cantidad"]
-            fig = px.bar(pir, x="Grupo", y="valor", color="Sexo", barmode="group", category_orders={"Grupo": GRUPOS_EDAD})
-            fig.update_layout(height=340, yaxis_title="% dentro de cada sexo" if pct else "Cantidad", xaxis_title=None,
+            n_sexo = pir.groupby("Sexo")["Cantidad"].sum()
+            pir["Sexo"] = pir["Sexo"].map(lambda x: f"{x} (n = {int(n_sexo[x]):,})".replace(",", "."))
+            fig = px.bar(pir, x="Grupo", y="valor", color="Sexo", barmode="group", category_orders={"Grupo": GRUPOS_EDAD},
+                         text_auto=".1f" if pct else ",.0f")
+            fig.update_traces(textposition="outside", textfont=dict(size=12), cliponaxis=False)
+            fig.update_yaxes(range=[0, float(pir["valor"].max()) * 1.15])
+            fig.update_layout(height=380, yaxis_title="% dentro de cada sexo" if pct else "Cantidad", xaxis_title=None,
                               margin=dict(t=20, b=10, l=10, r=10))
             st.plotly_chart(fig, use_container_width=True)
+            st.caption("«NO ESPECIFICADO» es un valor real del origen (sexo sin informar) y es un grupo muy pequeño: su distribución es inestable, "
+                       "no debe compararse con la de los otros dos. Entre paréntesis, el nº de estudios con edad de cada grupo.")
     a, b = st.columns(2)
     with a:
         if fecha_campo:
@@ -1588,8 +1708,11 @@ def ui_demo_clinica():
             if not dm.empty:
                 dm = dm.copy()
                 dm["valor"] = dm["Informes"] / dm["Informes"].sum() * 100 if pct else dm["Informes"]
-                fig = px.line(dm, x="Mes", y="valor", markers=True, color_discrete_sequence=["#0E7490"])
-                fig.update_layout(height=340, yaxis_title="% del total" if pct else "Informes", xaxis_title=None,
+                fig = px.line(dm, x="Mes", y="valor", markers=True, color_discrete_sequence=["#0E7490"],
+                              text=dm["valor"].map(lambda v: f"{v:.1f}%" if pct else f"{int(v):,}") if len(dm) <= 24 else None)
+                fig.update_traces(textposition="top center", textfont=dict(size=12), marker=dict(size=8))
+                fig.update_yaxes(range=[0, float(dm["valor"].max()) * 1.2])
+                fig.update_layout(height=360, yaxis_title="% del total" if pct else "Informes", xaxis_title=None,
                                   margin=dict(t=20, b=10, l=10, r=10))
                 st.plotly_chart(fig, use_container_width=True)
                 st.caption("El último mes puede estar incompleto.")
@@ -1600,8 +1723,10 @@ def ui_demo_clinica():
             if not dmo.empty:
                 fig = px.bar(dmo.sort_values("Edad media"), x="Edad media", y="Modalidad", orientation="h",
                              hover_data=["Informes"], color_discrete_sequence=["#8B5CF6"])
-                fig.update_traces(texttemplate="%{x:.1f}", textposition="outside")
-                fig.update_layout(height=max(300, 28 * len(dmo) + 100), yaxis_title=None, xaxis_title="Años",
+                fig.update_traces(texttemplate="%{x:.1f} años")
+                estilo_valores(fig)
+                fig.update_xaxes(range=[0, float(dmo["Edad media"].max()) * 1.18])
+                fig.update_layout(height=max(300, 32 * len(dmo) + 100), yaxis_title=None, xaxis_title="Años",
                                   margin=dict(t=20, b=10, l=10, r=10))
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1632,7 +1757,7 @@ def ui_demo_clinica():
             logy = st.checkbox("Escala logarítmica (para ver mejor los valores pequeños)", key="hist_log")
             fig = px.bar(dh, x="N", y="valor", text="etiqueta", color_discrete_sequence=["#6366F1"],
                          category_orders={"N": list(dh["N"])}, hover_data={"Informes": ":,", "valor": False, "etiqueta": False})
-            fig.update_traces(textposition="outside", cliponaxis=False)
+            fig.update_traces(textposition="outside", textfont=dict(size=14, color="#1E293B"), cliponaxis=False)
             fig.update_layout(height=320, xaxis_title="Estudios distintos en el informe", yaxis_title="% de informes" if pct else "Informes",
                               margin=dict(t=20, b=10, l=10, r=10), showlegend=False)
             fig.update_yaxes(type="log" if logy else "linear", **({} if logy else {"range": [0, float(dh["valor"].max()) * 1.15]}))
@@ -1649,11 +1774,14 @@ def ui_demo_clinica():
         dist["acum"] = dist["pct"].cumsum()
         top = dist.head(15)
         fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_bar(x=top[cc], y=top["pct"] if pct else top[cv], name="% del total" if pct else "Cantidad", marker_color="#6366F1")
-        fig.add_scatter(x=top[cc], y=top["acum"], name="% acumulado", mode="lines+markers", marker_color="#F59E0B", secondary_y=True)
+        fig.add_bar(x=top[cc], y=top["pct"] if pct else top[cv], name="% del total" if pct else "Cantidad", marker_color="#6366F1",
+                    text=[f"{v:.1f}%" if pct else f"{int(v):,}" for v in (top["pct"] if pct else top[cv])], textposition="auto",
+                    insidetextanchor="end", insidetextfont=dict(color="white", size=12), outsidetextfont=dict(color="#1E293B", size=12), cliponaxis=False)
+        fig.add_scatter(x=top[cc], y=top["acum"], name="% acumulado", mode="lines+markers+text", marker_color="#F59E0B", secondary_y=True,
+                        text=[f"{v:.0f}%" for v in top["acum"]], textposition="top center", textfont=dict(size=12, color="#B45309"))
         fig.update_yaxes(title_text="% del total" if pct else "Cantidad", secondary_y=False)
         fig.update_yaxes(title_text="% acumulado", range=[0, 100], secondary_y=True)
-        fig.update_layout(height=400, margin=dict(t=20, b=10, l=10, r=10), legend=dict(orientation="h", y=1.1))
+        fig.update_layout(height=440, margin=dict(t=20, b=10, l=10, r=10), legend=dict(orientation="h", y=1.1))
         st.plotly_chart(fig, use_container_width=True)
         n80 = int((dist["acum"] >= 80).idxmax()) + 1 if (dist["acum"] >= 80).any() else len(dist)
         st.caption(f"{n80} estudios acumulan el 80 % de la actividad (entre los {len(dist)} estudios más frecuentes).")
@@ -1725,8 +1853,12 @@ def ui_demo_clinica():
         for (x, y), n in pares.items():
             if x in mat.index and y in mat.columns:
                 mat.loc[x, y] = mat.loc[y, x] = n / n_multi * 100 if pct else n
-        fig = px.imshow(mat, text_auto=".1f" if pct else True, aspect="auto", color_continuous_scale="Purples")
-        fig.update_layout(height=max(400, 36 * top_n + 120), margin=dict(t=20, b=10, l=10, r=10))
+        esc100 = st.checkbox("Escala de color de 0 a 100 % (los valores reales son pequeños: se verá más tenue)", value=False, key="co_100") if pct else False
+        fig = px.imshow(mat, text_auto=".1f" if pct else True, aspect="auto", color_continuous_scale="Purples",
+                        zmin=0 if esc100 else None, zmax=100 if esc100 else None)
+        fig.update_traces(textfont=dict(size=13))
+        fig.update_layout(height=max(420, 40 * top_n + 120), margin=dict(t=20, b=10, l=10, r=10),
+                          coloraxis_colorbar=dict(title="% de informes" if pct else "Informes"))
         st.plotly_chart(fig, use_container_width=True)
         dp = pd.DataFrame([{"Estudio A": x, "Estudio B": y, "Informes": n, "% de informes": n / n_multi * 100}
                            for (x, y), n in pares.items()]).sort_values("Informes", ascending=False).head(20)
@@ -1764,7 +1896,8 @@ def ui_inferencial():
         c1, c2 = st.columns(2)
         ea = c1.selectbox("Variable A", dims, key="in_a")
         eb = c2.selectbox("Variable B", ["Clasificación"] + [x for x in dims if x != ea], key="in_b")
-        r = chi2_asociacion(tabla_contingencia(f, ea, eb))
+        tab_ = tabla_contingencia(f, ea, eb)
+        r = chi2_asociacion(tab_)
         if r is None:
             st.info("Datos insuficientes para este cruce.")
         else:
@@ -1779,8 +1912,18 @@ def ui_inferencial():
                            if r["p"] < alfa else f"no hay evidencia de asociación entre {ea} y {eb}.")
                         + (" Una asociación grande entre variables que dependen una de otra (p. ej. estudio y modalidad) es casi obvia y no aporta información nueva." if r["v"] >= .5 else "")
                         + (" Más del 20 % de celdas con frecuencia esperada < 5: reduce categorías para fiarte del χ²." if r["pct_esp_bajo"] > .2 else ""))
-            fig = px.imshow(r["res"], text_auto=".1f", aspect="auto", color_continuous_scale="RdBu_r", color_continuous_midpoint=0)
-            fig.update_layout(height=max(350, 30 * len(r["res"]) + 120), margin=dict(t=10, b=10, l=10, r=10))
+            res = r["res"]
+            opciones_o = ["Orden original (por nº de casos)", "Nombre (A–Z)", "Nº de casos (mayor primero)"] + [f"Residuo en «{c}» (mayor primero)" for c in res.columns]
+            orden_r = st.selectbox("Ordenar filas por", opciones_o, key="in_orden_res")
+            if orden_r.startswith("Nombre"):
+                res = res.loc[sorted(res.index, key=str)]
+            elif orden_r.startswith("Nº"):
+                res = res.loc[tab_.sum(axis=1).reindex(res.index).sort_values(ascending=False).index]
+            elif orden_r.startswith("Residuo"):
+                res = res.loc[res[orden_r.split("«")[1].split("»")[0]].sort_values(ascending=False).index]
+            fig = px.imshow(res, text_auto=".1f", aspect="auto", color_continuous_scale="RdBu_r", color_continuous_midpoint=0)
+            fig.update_traces(textfont=dict(size=13))
+            fig.update_layout(height=max(380, 34 * len(res) + 130), margin=dict(t=10, b=10, l=10, r=10), coloraxis_colorbar=dict(title="Residuo (z)"))
             st.plotly_chart(fig, use_container_width=True)
             st.caption("Residuos ajustados: |z| > 2 = combinación más (rojo) o menos (azul) frecuente de lo esperado si no hubiera relación.")
 
@@ -1814,12 +1957,26 @@ def ui_inferencial():
                 st.markdown(f"**Interpretación.** Tras la corrección de Holm, **{len(sig)} de {len(t)}** segmentos difieren del resto (se rechaza H₀). "
                             f"El mayor % es {hi_['Segmento']} ({hi_['% relevante']:.1f} %, OR {hi_['OR vs resto']:.2f}) y el menor {lo_['Segmento']} "
                             f"({lo_['% relevante']:.1f} %, OR {lo_['OR vs resto']:.2f}). OR > 1: más relevantes que el resto; OR < 1: menos.")
-                fig = px.scatter(t, x="% relevante", y="Segmento", color="Significativo", error_x=t["IC sup %"] - t["% relevante"],
-                                 error_x_minus=t["% relevante"] - t["IC inf %"], color_discrete_map={True: "#EF4444", False: "#94A3B8"})
-                fig.add_vline(x=K / N * 100, line_dash="dash", line_color="#334155")
-                fig.update_layout(height=max(350, 28 * len(t) + 120), margin=dict(t=10, b=10, l=10, r=10), yaxis_title=None)
+                orden_t = st.selectbox("Ordenar segmentos por", ["% relevante (mayor primero)", "% relevante (menor primero)", "Nombre (A–Z)",
+                                                                  "Nº de estudios (mayor primero)", "OR vs resto (mayor primero)", "Significativos primero"], key="in_orden_tasa")
+                col_o, asc_o = {"% relevante (mayor primero)": ("% relevante", False), "% relevante (menor primero)": ("% relevante", True),
+                                "Nombre (A–Z)": ("Segmento", True), "Nº de estudios (mayor primero)": ("Estudios", False),
+                                "OR vs resto (mayor primero)": ("OR vs resto", False), "Significativos primero": ("Significativo", False)}[orden_t]
+                to = t.sort_values([col_o, "% relevante"], ascending=[asc_o, False]).copy()
+                to["Etiqueta"] = [f"{a_:.1f} % · n={b_:,}".replace(",", ".") for a_, b_ in zip(to["% relevante"], to["Estudios"])]
+                fig = px.scatter(to, x="% relevante", y="Segmento", color="Significativo", text="Etiqueta", error_x=to["IC sup %"] - to["% relevante"],
+                                 error_x_minus=to["% relevante"] - to["IC inf %"], color_discrete_map={True: "#EF4444", False: "#94A3B8"},
+                                 category_orders={"Segmento": list(to["Segmento"])})
+                fig.add_vline(x=K / N * 100, line_dash="dash", line_color="#334155",
+                              annotation_text=f"global {K / N * 100:.1f} %", annotation_position="top")
+                fig.update_traces(textposition="top center", textfont=dict(size=12), marker=dict(size=10))
+                fig.update_yaxes(autorange="reversed")
+                fig.update_layout(height=max(380, 36 * len(to) + 130), margin=dict(t=30, b=10, l=10, r=10), yaxis_title=None,
+                                  xaxis_title="% de estudios RELEVANTES (IC)")
                 st.plotly_chart(fig, use_container_width=True)
-                tabla = t.drop(columns=["IC inf %", "IC sup %"]).round(4)
+                st.caption("Cada punto es un segmento: su etiqueta muestra el % de relevantes y el número de estudios; la línea discontinua es la tasa global. "
+                           "En rojo los que difieren del resto tras Holm.")
+                tabla = to.drop(columns=["IC inf %", "IC sup %", "Etiqueta"]).round(4)
                 with st.expander("Ver tabla y descargar"):
                     st.dataframe(tabla, use_container_width=True, hide_index=True)
                     st.download_button("📥 Descargar (CSV)", tabla.to_csv(index=False).encode("utf-8"), file_name="inferencia_proporciones.csv")
@@ -1846,9 +2003,21 @@ def ui_inferencial():
                                if a["pw"] < alfa else f"no hay evidencia de que la edad media difiera entre grupos de {dimE}."))
                 d = d.copy()
                 d["IC95"] = sps.t.ppf(0.975, d["n"] - 1) * d["sd"] / np.sqrt(d["n"])
-                fig = px.scatter(d.sort_values("m"), x="m", y="Grupo", error_x="IC95", color_discrete_sequence=["#8B5CF6"])
-                fig.update_layout(height=max(320, 28 * len(d) + 120), margin=dict(t=10, b=10, l=10, r=10), xaxis_title="Edad media (IC 95 %)", yaxis_title=None)
+                orden_e = st.selectbox("Ordenar grupos por", ["Edad media (mayor primero)", "Edad media (menor primero)", "Nombre (A–Z)",
+                                                              "Nº de estudios (mayor primero)"], key="in_orden_edad")
+                col_e, asc_e = {"Edad media (mayor primero)": ("m", False), "Edad media (menor primero)": ("m", True),
+                                "Nombre (A–Z)": ("Grupo", True), "Nº de estudios (mayor primero)": ("n", False)}[orden_e]
+                de = d.sort_values(col_e, ascending=asc_e).copy()
+                de["Etiqueta"] = [f"{m_:.1f} años · n={n_:,}".replace(",", ".") for m_, n_ in zip(de["m"], de["n"])]
+                fig = px.scatter(de, x="m", y="Grupo", error_x="IC95", text="Etiqueta", color_discrete_sequence=["#8B5CF6"],
+                                 category_orders={"Grupo": list(de["Grupo"])})
+                fig.update_traces(textposition="top center", textfont=dict(size=12), marker=dict(size=10))
+                fig.update_yaxes(autorange="reversed")
+                fig.update_layout(height=max(340, 38 * len(de) + 130), margin=dict(t=10, b=10, l=10, r=10), xaxis_title="Edad media (IC 95 %)", yaxis_title=None)
                 st.plotly_chart(fig, use_container_width=True)
+                with st.expander("Ver valores por grupo"):
+                    st.dataframe(pd.DataFrame({"Grupo": de["Grupo"], "Estudios": de["n"], "Edad media": de["m"].round(1),
+                                               "Desv. típica": de["sd"].round(1), "IC95 (±)": de["IC95"].round(2)}), use_container_width=True, hide_index=True)
 
     with t4:
         st.info("**H₀:** no hay tendencia lineal en la proporción mensual de estudios RELEVANTES (pendiente = 0).  **H₁:** la proporción sube o baja de forma sostenida.")
@@ -1883,8 +2052,10 @@ def ui_inferencial():
                     tt = pd.DataFrame({"Mes": p.index, "% relevante": k_m.values / n_m.values * 100,
                                        "lo": [c[0] * 100 for c in ic], "hi": [c[1] * 100 for c in ic]})
                     fig = px.line(tt, x="Mes", y="% relevante", markers=True, error_y=tt["hi"] - tt["% relevante"],
-                                  error_y_minus=tt["% relevante"] - tt["lo"], color_discrete_sequence=["#EF4444"])
-                    fig.update_layout(height=380, margin=dict(t=10, b=10, l=10, r=10))
+                                  error_y_minus=tt["% relevante"] - tt["lo"], color_discrete_sequence=["#EF4444"],
+                                  text=tt["% relevante"].map(lambda v: f"{v:.1f}%") if len(tt) <= 24 else None)
+                    fig.update_traces(textposition="top center", textfont=dict(size=12), marker=dict(size=8))
+                    fig.update_layout(height=420, margin=dict(t=10, b=10, l=10, r=10), yaxis_title="% de estudios RELEVANTES")
                     st.plotly_chart(fig, use_container_width=True)
 
 
